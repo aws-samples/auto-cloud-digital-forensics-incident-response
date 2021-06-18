@@ -27,7 +27,7 @@ The type of data to collect in a "live" targeted DFIR is only limited by your ow
 
 After data is collected in the shared file system, the solution also provides the means to leverage AWS DataSync to secure transfer data on the shared file system from the Target account to an S3 bucket back in our DFIR account. The beauty of using AWS DataSync is that it comes with forensics equivalent features including data integrity checksum verification, metadata copy preservation as well as detailed transfer task logging. All of these are useful in a DFIR process.
 
-![](Mysolution.png)
+![](MyArtifact.png)
 
 ## DFIR Infrastructure Preparation Instructions
 
