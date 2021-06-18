@@ -1,4 +1,4 @@
-## Automated Cloud Digital Forensics Incident Response (DFIR)
+## Auto Cloud Digital Forensics Incident Response (DFIR)
 
 
 ## Background
