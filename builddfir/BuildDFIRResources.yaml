@@ -1,0 +1,672 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies the resources in DFIR account
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: DFIR VPC Information
+        Parameters:
+          - DFIRCIDRRange
+          - DFIRSubnetInfo
+          - DFIRVPCId
+          - DFIRSubnetId
+          - DFIRRouteTbId
+      - Label:
+          default: DataSync Agents Information from Target Account
+        Parameters:
+          - DSAEC2IP1
+          - DSAEC2IP2
+          - DSAEC2IP3
+          - DSASGId1
+          - DSASGId2
+          - DSASGId3
+      - Label:
+          default: Bucket name for security triage
+        Parameters:
+          - TriageBucketName
+      - Label:
+          default: Target Account Information 
+        Parameters:
+          - TargetVpcId
+          - TargetCIDRRange
+          - TargetAcctId
+      - Label:
+          default: VPC Peering Information between Target and DFIR accounts
+        Parameters:
+          - VPRoleARN
+          - ExistingPeerId
+
+Parameters:
+  DFIRVPCId:
+    Type: String
+    Description: 'Specify the existing peer DFIR VPC Id'
+    Default: 'None'  
+  DFIRSubnetId:
+    Type: String
+    Description: 'Specify the associated DFIR Subnet Id for the peer DFIR VPC'
+    Default: 'None'
+  DFIRRouteTbId:
+    Type: String
+    Description: 'Specify the associated Route Table Id for the peer DFIR VPC'
+    Default: 'None'
+  DFIRCIDRRange:
+    Type: String
+    Description: 'Specify a CIDR Range for your DFIR VPC:'
+    Default: 'None'
+  DFIRSubnetInfo:
+    Type: String
+    Description: 'Specify a Subnet for your DFIR VPC'
+    Default: 'None'
+  DSAEC2IP1:
+    Type: String
+    Description: 'Specify the IP address of datasync agent one'
+  DSAEC2IP2:
+    Type: String
+    Description: 'Specify the IP address of datasync agent two'
+    Default: 'None'
+  DSAEC2IP3:
+    Type: String
+    Description: 'Specify the IP address of datasync agent three'
+    Default: 'None'
+  TargetAcctId:
+    Type: String
+    Description: 'Please provide the 12 Digit AWS Account Number of the Target'
+    MaxLength: 12
+    MinLength: 12    
+    Default: '012345678912'
+  TriageBucketName:
+    Type: String
+    Description: 'Specify a bucket name for security triage'
+  VPRoleARN:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the ARN of the target VPC peering role'
+  ExistingPeerId:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the existing VPC peering ID'
+  TargetVpcId:
+    Type: String
+    Description: 'Specify the target VPC Id'
+    Default: 'None'
+  TargetCIDRRange:
+    Type: String
+    Description: 'Specify a CIDR Range for your Target VPC:'
+    Default: 'None'
+  DSASGId1:
+    Type: String
+    Description: 'Specify the security group Id for datasync agent one'
+  DSASGId2:
+    Type: String
+    Description: 'Specify the security group Id for datasync agent two'    
+  DSASGId3:
+    Type: String
+    Description: 'Specify the security group Id for datasync agent three'    
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Conditions:
+  VPRoleARNCheck:
+    !Not [!Equals [!Ref VPRoleARN, 'None']]
+  DefaultDSAEC2IP2:
+    !Equals [!Ref DSAEC2IP2, 'None']
+  NotDefaultDSAEC2IP2: !And 
+    - !Not [!Equals [!Ref DSAEC2IP2, 'None']]
+    - !Equals [!Ref DSAEC2IP3, 'None']
+  NotDefaultDSAEC2IP3: !And
+    - !Not [!Equals [!Ref DSAEC2IP2, 'None']]
+    - !Not [!Equals [!Ref DSAEC2IP3, 'None']]
+
+Resources:
+  DFIRVPC:
+    Condition: VPRoleARNCheck
+    Type: AWS::EC2::VPC
+    Properties: 
+      CidrBlock: !Ref DFIRCIDRRange
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: 
+        - Key: Environment
+          Value: DFIR
+  
+  DFIRSubnet:
+    Condition: VPRoleARNCheck
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !Ref DFIRSubnetInfo
+      Tags: 
+        - Key: Environment
+          Value: DFIR
+      VpcId: !Ref DFIRVPC
+
+  DFIRToTargetVPCPeerConnect:
+    Condition: VPRoleARNCheck
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties: 
+      PeerOwnerId: !Ref TargetAcctId
+      PeerRoleArn: !Ref VPRoleARN
+      PeerVpcId: !Ref TargetVpcId
+      Tags: 
+        - Key: Environment
+          Value: DFIR
+      VpcId: !Ref DFIRVPC
+
+  DFIRRouteTb:
+    Condition: VPRoleARNCheck
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      Tags: 
+        - Key: Environment
+          Value: DFIR
+      VpcId: !Ref DFIRVPC
+
+  DFIRRoute:
+    Condition: VPRoleARNCheck
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: !Ref TargetCIDRRange
+      RouteTableId: !Ref DFIRRouteTb
+      VpcPeeringConnectionId: !Ref DFIRToTargetVPCPeerConnect
+
+  SubnetRouteTableAssociation:
+    Condition: VPRoleARNCheck
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      RouteTableId: !Ref DFIRRouteTb
+
+  SecGrpForDataSyncVPCe:
+    Condition: DefaultDSAEC2IP2
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync VPC endpoint
+      GroupName: SecGrpForDataSyncVPCe
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic All protocols Outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress: 
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent one 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow https from datasync agent one 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !GetAtt ActivateDSAEC2.PrivateIp, '32' ] ]
+          Description: Allow https from activate agent ec2
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  SecGrpForDataSyncVPCe2:
+    Condition: NotDefaultDSAEC2IP2
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync VPC endpoint
+      GroupName: SecGrpForDataSyncVPCe
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic All protocols Outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress: 
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent one 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow https from datasync agent one 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP2, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent two 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP2, '32' ] ]
+          Description: Allow https from datasync agent two
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !GetAtt ActivateDSAEC2.PrivateIp, '32' ] ]
+          Description: Allow https from activate agent ec2
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  SecGrpForDataSyncVPCe3:
+    Condition: NotDefaultDSAEC2IP3
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync VPC endpoint
+      GroupName: SecGrpForDataSyncVPCe
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic All protocols Outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress: 
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent one 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP1, '32' ] ]
+          Description: Allow https from datasync agent one 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP2, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent two 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP2, '32' ] ]
+          Description: Allow https from datasync agent two
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP3, '32' ] ]
+          Description: Allow specific tcp 1024-1064 traffic from datasync agent three 
+          FromPort: 1024
+          IpProtocol: tcp
+          ToPort: 1064
+        - CidrIp: !Join [ '/', [ !Ref DSAEC2IP3, '32' ] ]
+          Description: Allow https from datasync agent three
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: !Join [ '/', [ !GetAtt ActivateDSAEC2.PrivateIp, '32' ] ]
+          Description: Allow https from activate agent ec2
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  DataSyncVPCendpoint:
+    Condition: DefaultDSAEC2IP2
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !GetAtt SecGrpForDataSyncVPCe.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.datasync'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  DataSyncVPCendpoint2:
+    Condition: NotDefaultDSAEC2IP2
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !GetAtt SecGrpForDataSyncVPCe2.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.datasync'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  DataSyncVPCendpoint3:
+    Condition: NotDefaultDSAEC2IP3
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !GetAtt SecGrpForDataSyncVPCe3.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.datasync'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  # DataSyncS3AccessRole:
+  #   Type: AWS::IAM::Role
+  #   Properties: 
+  #     AssumeRolePolicyDocument:
+  #       Statement: 
+  #         - 
+  #           Effect: "Allow"
+  #           Principal: 
+  #             Service: 
+  #               - "datasync.amazonaws.com"
+  #           Action: 
+  #             - "sts:AssumeRole"   
+  #     Description: Custom Role for AWS DataSync
+  #     Policies: 
+  #       - PolicyName: DataSyncS3AccessPolicy
+  #         PolicyDocument:
+  #           Version: "2012-10-17"
+  #           Statement:
+  #             - Sid: AWSDataSyncGetBucket
+  #               Effect: Allow
+  #               Action:
+  #                 - s3:GetBucketAcl
+  #                 - s3:GetBucketLocation
+  #                 - s3:ListBucket
+  #                 - s3:ListBucketMultipartUploads
+  #               Resource: !Sub 'arn:aws:s3:::${TriageBucketName}'
+  #             - Sid: AWSDataSyncPutObjects
+  #               Effect: Allow
+  #               Action: 
+  #                 - s3:AbortMultipartUpload
+  #                 - s3:DeleteObject
+  #                 - s3:GetObject
+  #                 - s3:ListMultipartUploadParts
+  #                 - s3:GetObjectTagging
+  #                 - s3:PutObjectTagging
+  #                 - s3:PutObject
+  #               Resource: !Join [ '/', [ !Sub 'arn:aws:s3:::${TriageBucketName}', '*' ] ]
+  #             - Sid: AWSDataSyncPutLogs
+  #               Effect: Allow
+  #               Action: 
+  #                 - logs:PutLogEvents
+  #                 - logs:CreateLogStream
+  #               Resource: '*'      
+  #     RoleName: DataSyncS3AccessRole
+
+  # DataSyncSource:
+  #   DependsOn: S3VPCendpoint
+  #   Type: AWS::DataSync::LocationS3
+  #   Properties: 
+  #     S3BucketArn: !Sub 'arn:aws:s3:::${TriageBucketName}'
+  #     S3Config: 
+  #       BucketAccessRoleArn: !GetAtt DataSyncS3AccessRole.Arn
+  #     Subdirectory: '/TriageBinaries'
+
+  ManagedInstancesSecGrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for SSM Managed Instances
+      GroupName: ManagedInstancesSecGrp
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic All protocols Outbound
+          IpProtocol: '-1'
+      Tags: 
+        - Key: Environment
+          Value: DFIR
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  GenericVPCeSecGrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for Generic VPC Interface endpoints
+      GroupName: GenericVPCeSecGrp
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic All protocols Outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !GetAtt ManagedInstancesSecGrp.GroupId
+          SourceSecurityGroupOwnerId: !Sub '${AWS::AccountId}'
+          Description: All incoming from Managed Instances Security Grp
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      Tags:
+        - Key: Environment
+          Value: DFIR
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  CodeDeployVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codedeploy'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  CodeDeployCSVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codedeploy-commands-secure'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  EC2VPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  SSMVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  SSMMessagesVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  EC2MessagesVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  CWLogsVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  EventBridgeVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt GenericVPCeSecGrp.GroupId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.events'
+      SubnetIds: 
+        - !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+      VpcEndpointType: Interface
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  S3VPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds:
+        - !If [ VPRoleARNCheck, !Ref DFIRRouteTb, !Ref DFIRRouteTbId ]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      VpcId: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+
+  ActivateDSAEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ActivateDSAEC2Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ActivateDSAPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - datasync:CreateAgent
+                Resource: !Sub 'arn:aws:datasync:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcEndpoints
+                  - s3:Get*
+                  - s3:List*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - codedeploy-commands-secure:GetDeploymentSpecification
+                  - codedeploy-commands-secure:PollHostCommand
+                  - codedeploy-commands-secure:PutHostCommandAcknowledgement
+                  - codedeploy-commands-secure:PutHostCommandComplete
+                Resource: '*'
+
+  ActivateDSAEC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ActivateDSAInstanceProfile
+      Roles:
+        - !Ref ActivateDSAEC2Role
+
+  ActivateDSAEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref ActivateDSAEC2Profile
+      ImageId: !Ref LatestAmiId
+      InstanceType: t2.micro
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            Encrypted: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          GroupSet: [!GetAtt ManagedInstancesSecGrp.GroupId]
+          SubnetId: !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]   
+      SourceDestCheck: true
+      UserData: 
+       'Fn::Base64': !Join
+        - ''
+        - - "#!/bin/bash\n"
+          - "yum update -y \n"
+          - "yum install ruby -y\n"
+          - "yum install aws-cli -y\n"
+          - "yum install wget -y\n"
+          - "cd /tmp\n"
+          - !Sub 'wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install'
+          - "\n"
+          - "chmod +x ./install\n"
+          - "./install auto\n"
+          - "echo -e \"\n:enable_auth_policy: true\" | tee -a /etc/codedeploy-agent/conf/codedeployagent.yml >/dev/null"
+          - "service codedeploy-agent status\n"
+          - "service codedeploy-agent start\n"
+          - "service codedeploy-agent restart"
+      Tags:
+        - Key: DFIRResources
+          Value: ActivateCreateDataSyncAgent
+
+Outputs:
+  SGDSVe:
+    Description: DataSyncVPCEndpointSecurityGrp
+    Value: !If [DefaultDSAEC2IP2, !Ref SecGrpForDataSyncVPCe, 'None']
+  SGDSVe2:
+    Description: DataSyncVPCEndpointSecurityGrp2
+    Value: !If [NotDefaultDSAEC2IP2, !Ref SecGrpForDataSyncVPCe2, 'None']
+  SGDSVe3:
+    Description: DataSyncVPCEndpointSecurityGrp3
+    Value: !If [NotDefaultDSAEC2IP3, !Ref SecGrpForDataSyncVPCe3, 'None']
+  VeId: 
+    Description: DataSyncVPCEndpointId
+    Value: !If [DefaultDSAEC2IP2, !Ref DataSyncVPCendpoint, 'None']
+  Ve2Id:
+    Description: DataSyncVPCEndpointId2
+    Value: !If [NotDefaultDSAEC2IP2, !Ref DataSyncVPCendpoint2, 'None']
+  Ve3Id:
+    Description: DataSyncVPCEndpointId3
+    Value: !If [NotDefaultDSAEC2IP3, !Ref DataSyncVPCendpoint3, 'None']
+  TA:
+    Description: TargetAccountId
+    Value: !Ref TargetAcctId
+  TVpcID:
+    Description: TargetVPCId
+    Value: !Ref TargetVpcId
+  Pi:
+    Description: VPCPeeringConnectionId
+    Value: !If [VPRoleARNCheck, !Ref DFIRToTargetVPCPeerConnect, !Ref ExistingPeerId]
+  SN:
+    Description: DFIRAccountSubnetId
+    Value: !If [ VPRoleARNCheck, !Ref DFIRSubnet, !Ref DFIRSubnetId ]
+  DR:
+    Description: DFIRAccountCIDRRange
+    Value: !Ref DFIRCIDRRange
+  DSASGID1:
+    Description: DataSyncAgent1SecurityGroupId
+    Value: !Ref DSASGId1
+  DSASGID2:
+    Description: DataSyncAgent2SecurityGroupId
+    Value: !Ref DSASGId2
+  DSASGID3:
+    Description: DataSyncAgent3SecurityGroupId
+    Value: !Ref DSASGId3
+  VId:
+    Description: DFIRAccountVPCId
+    Value: !If [ VPRoleARNCheck, !Ref DFIRVPC, !Ref DFIRVPCId ]
+  Bkt:
+    Description: TriageBucketName
+    Value: !Ref TriageBucketName
+  DSAIP1:
+    Description: DataSyncAgent1EC2IPAddress
+    Value: !Ref DSAEC2IP1
+  DSAIP2:
+    Description: DataSyncAgent2EC2IPAddress
+    Value: !If [NotDefaultDSAEC2IP2, !Ref DSAEC2IP2, 'None']
+  DSAIP3:
+    Description: DataSyncAgent3EC2IPAddress
+    Value: !If [NotDefaultDSAEC2IP3, !Ref DSAEC2IP3, 'None'] 

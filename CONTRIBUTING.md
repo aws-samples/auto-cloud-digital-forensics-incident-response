@@ -57,3 +57,12 @@ If you discover a potential security issue in this project we ask that you notif
 ## Licensing
 
 See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+
+
+## Future Enhancements / Roadmap
+
+We value your ideas! Below is the current wishlist of this project's development roadmap:
+
+- To include custom Incident Response (IR) triage [runbooks](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-documents.html) that work with AWS Systems Manager Automation capability.
+- To create new trigger parsers for suspicious EC2 instances such as Amazon GuardDuty events instead of reading from targetinstances.txt hardcoded file.
+- To add support for suspicious Containers.

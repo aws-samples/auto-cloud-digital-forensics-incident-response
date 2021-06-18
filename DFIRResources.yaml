@@ -1,0 +1,556 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies the DFIR resources required in the DFIR account including initial S3 bucket storing targets to triage (this can be replaced with EventBridge Rules as future enhancement)
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: DFIR account number
+        Parameters:
+          - DFIRAccountId
+      - Label:
+          default: Security Triage Information
+        Parameters:
+          - SecurityTriageBucketName
+          - SecurityEmailAddress
+      - Label:
+          default: Initialize New CodeCommit Repository for BuildDFIRPipeline
+        Parameters:
+          - LayerVersionARN
+      - Label:
+          default: Bucket Name used to build DFIR resources in DFIR account
+        Parameters:
+          - BuildDFIRBucketName
+      - Label:
+          default: Your Organization ID
+        Parameters:
+          - OrganizationID
+Parameters:
+  DFIRAccountId:
+    Type: String
+    MinLength: 12
+    MaxLength: 12
+    Description: 'Specify the account number for DFIR'
+  SecurityTriageBucketName:
+    Type: String
+    Description: 'Specify the bucket name where you store target information to triage'
+  SecurityEmailAddress:
+    Type: String
+    Description: 'Specify the email address to receive DFIR Lambda failure notifications'
+  LayerVersionARN:
+    Type: String
+    Description: 'Specify the ARN of the Lambda Function'
+  BuildDFIRBucketName:
+    Type: String
+    Description: 'Specify the bucket name used to build DFIR resources'
+  OrganizationID:
+    Type: String
+    Description: 'Specify your organization ID'
+
+Resources:
+  InitRepoResource:
+    Type: Custom::InitRepoResource
+    Properties: 
+      ServiceToken: !GetAtt InitializeRepoLambda.Arn
+      RepoName: DFIR1
+      BuildBucketName: !Ref BuildDFIRBucketName
+
+  InitializeRepoLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          codecommit = boto3.client('codecommit')
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+            repoName = event['ResourceProperties']['RepoName']
+            buildbucket = event['ResourceProperties']['BuildBucketName']
+            responseData = {}
+            if event['RequestType'] == 'Create':
+                r = codecommit.create_repository(repositoryName=repoName)
+                responseData['repositoryName'] = r['repositoryMetadata']['repositoryName']
+                if r['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    key = 'BuildDFIRResources.yaml'
+                    builddfirres = '/tmp/' + key
+                    s3.download_file(buildbucket, key, builddfirres)
+                    with open(builddfirres, 'rb') as f:                      
+                        s = codecommit.put_file(repositoryName=repoName, branchName='main', fileContent=f.read(), filePath='BuildDFIRResources.yaml',fileMode='NORMAL',commitMessage='Added BuildDFIRResources',name='InitializeDFIRRepoOne', email='jasmchua@amazon.com')
+                        responseData['commitId'] = s['commitId']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = r
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+            if event['RequestType'] == 'Delete' or event['RequestType'] == 'Update':
+                e = codecommit.delete_repository(repositoryName=repoName)
+                if e['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = e
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      Description: 'Initialize codecommit repository'
+      FunctionName: InitializeRepoLambda
+      Handler: index.lambda_handler
+      Role: !GetAtt InitializeRepoRole.Arn
+      Layers:
+        - !Ref LayerVersionARN
+      Runtime: python3.8
+      Timeout: 900
+      MemorySize: 1024
+
+  InitializeRepoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InitializeRepoRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - 
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CreateRepository
+                  - codecommit:DeleteRepository
+                  - codecommit:CreateBranch
+                  - codecommit:DeleteBranch
+                  - codecommit:PutFile
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR1'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildDFIRBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildDFIRBucketName}/*'
+          PolicyName: PermissionsInitRepo
+
+  SecurityTriageBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      BucketName: !Ref SecurityTriageBucketName
+      VersioningConfiguration:
+        Status: Enabled
+
+  SecurityTriageBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    DependsOn: SecurityTriageBucket
+    Properties:
+      Bucket: !Ref SecurityTriageBucketName
+      PolicyDocument:
+        Statement:
+          - Sid: "DenyInsecureConnections"
+            Effect: Deny
+            Principal: "*"
+            Action:
+            - 's3:*'
+            Resource:
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}'
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: "AllowPutObjects"
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+            - s3:PutObject
+            - s3:PutObjectAcl
+            - s3:PutObjectVersionAcl
+            Resource:
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}'
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:PrincipalOrgID: !Ref OrganizationID
+          - Sid: "AllowGetObjects"
+            Effect: Allow
+            Principal: 
+              AWS: '*'
+            Action:
+            - s3:ListBucket
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:GetObjectAcl
+            Resource:
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}'
+            - !Sub 'arn:aws:s3:::${SecurityTriageBucketName}/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: 
+                  - !Ref OrganizationID
+          - Sid: AWSDataSyncToBucket
+            Effect: Allow
+            Principal:
+              Service: 'datasync.amazonaws.com'
+            Action:
+            - s3:GetBucketLocation
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            Resource: !Sub 'arn:aws:s3:::${SecurityTriageBucketName}'
+          - Sid: AWSDataSyncToS3Objects
+            Effect: Allow
+            Principal:
+              Service: 'datasync.amazonaws.com'
+            Action:
+            - s3:AbortMultipartUpload
+            - s3:DeleteObject
+            - s3:GetObject
+            - s3:ListMultipartUploadParts
+            - s3:PutObjectTagging
+            - s3:GetObjectTagging
+            - s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${SecurityTriageBucketName}/*'
+
+  EFSEncryptKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'A Key used to encrypt EFS file system in target accounts'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Enable access for Root user
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: kms:*
+          Resource: '*'
+        - Sid: Enable cross-account access
+          Effect: Allow
+          Principal:
+            AWS: '*'
+          Action:
+            - kms:Encrypt
+            - kms:ReEncrypt*
+            - kms:GenerateDataKey*
+            - kms:Decrypt
+            - kms:DescribeKey
+            - kms:CreateGrant
+          Resource: '*'
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Ref OrganizationID
+      Tags: 
+        - Key: Name
+          Value: DFIR
+
+  EFSEncryptKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: 'alias/DFIR-EFS-KEY'
+      TargetKeyId: !Ref EFSEncryptKey
+
+  SNSEncryptKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'A Key used to encrypt SNS topic used by DFIR Lambda functions'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Enable access for Root user
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: kms:*
+          Resource: '*'
+        - Sid: Enable access for SNS and Lambda services
+          Effect: Allow
+          Principal:
+            Service: 
+              - sns.amazonaws.com
+              - lambda.amazonaws.com
+          Action:
+            - kms:GenerateDataKey*
+            - kms:Decrypt
+          Resource: '*'
+      Tags: 
+        - Key: Name
+          Value: DFIR
+
+  SecurityNoticeTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Failure Notifications From DFIR Lambda Invokes'
+      KmsMasterKeyId: !Ref SNSEncryptKey
+      Subscription: 
+        - Endpoint: !Ref SecurityEmailAddress
+          Protocol: Email
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      TopicName: DFIRLambdaFailureNotifications
+
+  SecurityNoticeTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      PolicyDocument:
+        Id: SecurityNoticeTopicforAlarmsPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: Allow Lambda to publish to this topic only
+          Effect: Allow
+          Principal:
+            AWS: 
+              - !GetAtt StartDFIRParentLambdaFunctionRole.Arn
+              - !GetAtt StartDFIRChildLambdaFunctionRole.Arn
+          Action:
+            - sns:Publish
+          Resource: !Ref SecurityNoticeTopic      
+      Topics: 
+        - !Ref SecurityNoticeTopic
+
+  PrepMemberAcctLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PrepMemberAcctLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationID
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PermissionsForLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:PutFile
+                Resource: 
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR1'
+
+  StartDFIRParentLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DFIRParentLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PermissionsForLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:InvokeAsync
+                Resource: !GetAtt StartDFIRChildLambda.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref SecurityNoticeTopic
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SecurityTriageBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Join [ "/", [!GetAtt SecurityTriageBucket.Arn, "*"] ]
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey*
+                  - kms:Decrypt
+                Resource:
+                  - '*'
+
+  StartDFIRParentLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ./StartDFIRParent
+      DeadLetterConfig: 
+        TargetArn: !Ref SecurityNoticeTopic
+      Description: 'Parent DFIR Lambda function'
+      FunctionName: StartDFIRParent
+      Handler: StartDFIRParent.lambda_handler
+      Role: !GetAtt StartDFIRParentLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      Timeout: 5
+
+  StartDFIRChildLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DFIRChildLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PermissionsForLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroup*
+                  - ec2:CreateRoute
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeNetworkInterfaces
+                  - codecommit:GetBranch
+                  - codecommit:PutFile
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                  - kms:GenerateDataKey*
+                  - kms:Decrypt
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityNoticeTopic
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - 'arn:aws:iam::*:role/MemberDFIRInvokerRole'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SecurityTriageBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Join [ "/", [!GetAtt SecurityTriageBucket.Arn, "*"] ]
+
+  StartDFIRChildLambda:
+    DependsOn: StartDFIRChildLambdaFunctionRole
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ./StartDFIRChild
+      Timeout: 60
+      DeadLetterConfig: 
+        TargetArn: !Ref SecurityNoticeTopic
+      Description: 'Child DFIR Lambda function'
+      Environment:
+        Variables:
+          DFIRAccountId: !Ref DFIRAccountId
+          SecurityTriageBucketName: !Ref SecurityTriageBucketName
+          DFIRCodeRepo: DFIR1
+      FunctionName: StartDFIRChild
+      Handler: StartDFIRChild.lambda_handler
+      Role: !GetAtt StartDFIRChildLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Tags: 
+        - Key: Name
+          Value: DFIR
+
+  MonitorTriageBucketCWRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers when object is put on Security Triage bucket
+      Name: 'MonitorTriageBucket-Rule'
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - Ref: SecurityTriageBucketName
+            key:
+              - targetinstances.txt
+      State: ENABLED
+      Targets:
+        - 
+          Arn:
+            Fn::GetAtt:
+              - 'StartDFIRParentLambda'
+              - 'Arn'
+          Id: 'MonitorTriageBucketRule'
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: 'StartDFIRParentLambda'
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn:
+        Fn::GetAtt:
+          - 'MonitorTriageBucketCWRule'
+          - 'Arn'
+
+Outputs:
+  CodeRepoName:
+    Value: !GetAtt InitRepoResource.repositoryName
+  TriageBucketARN: 
+    Value: !GetAtt SecurityTriageBucket.Arn
+  PrepMemberAcctLambdaRoleARN:
+    Value: !GetAtt PrepMemberAcctLambdaRole.Arn
+  LayerVARN:
+    Value: !Ref LayerVersionARN
+  DFIRChildLambdaFunctionRoleARN:
+    Value: !GetAtt StartDFIRChildLambdaFunctionRole.Arn

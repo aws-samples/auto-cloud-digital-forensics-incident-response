@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies the DFIR Pipeline related resources required in the DFIR account
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: DFIR Child Lambda Role ARN
+        Parameters:
+          - DFIRChildLambdaRoleARN
+      - Label:
+          default: Initialize New CodeCommit Repository for ActivateDSAPipeline
+        Parameters:
+          - BuildBucketName
+          - LayerVersionARN
+Parameters:
+  DFIRChildLambdaRoleARN:
+    Type: String
+    Description: 'Specify the DFIR child lambda role ARN'
+  BuildBucketName:
+    Type: String
+    Description: 'Specify the build DFIR bucket name'
+  LayerVersionARN:
+    Type: String
+    Description: 'Specify the ARN of the Lambda Function'
+
+Resources:
+  InitDSARepoResource:
+    Type: Custom::InitDSARepoResource
+    Properties: 
+      ServiceToken: !GetAtt InitializeDSARepoLambda.Arn
+      RepoName: 'DFIR2'
+      BuildBucketName: !Ref BuildBucketName
+
+  InitializeDSARepoLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          codecommit = boto3.client('codecommit')
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+            repoName = event['ResourceProperties']['RepoName']
+            buildbucket = event['ResourceProperties']['BuildBucketName']
+            responseData = {}
+            if event['RequestType'] == 'Create':
+                r = codecommit.create_repository(repositoryName=repoName)
+                responseData['repositoryName'] = r['repositoryMetadata']['repositoryName']
+                if r['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    key = 'appspec.yml'
+                    appspecfile = '/tmp/' + key
+                    s3.download_file(buildbucket, key, appspecfile)
+                    with open(appspecfile, 'rb') as f:                 
+                        s = codecommit.put_file(repositoryName=repoName, branchName='main', fileContent=f.read(), filePath='appspec.yml',fileMode='NORMAL',commitMessage='Added appspec',name='InitializeDSARepoLambda', email='jasmchua@amazon.com')
+                        responseData['commitId'] = s['commitId']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = r
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+            if event['RequestType'] == 'Delete' or event['RequestType'] == 'Update':
+                e = codecommit.delete_repository(repositoryName=repoName)
+                if e['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = e
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      Description: 'Initialize ActivateDSAPipeline codecommit repository'
+      FunctionName: InitializeDSARepoLambda
+      Handler: index.lambda_handler
+      Role: !GetAtt InitializeDSARepoRole.Arn
+      Layers:
+        - !Ref LayerVersionARN
+      Runtime: python3.8
+      Timeout: 900
+      MemorySize: 1024
+
+  InitializeDSARepoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InitializeDSARepoRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - 
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CreateRepository
+                  - codecommit:DeleteRepository
+                  - codecommit:CreateBranch
+                  - codecommit:DeleteBranch
+                  - codecommit:PutFile
+                Resource:
+                  - !Join [ ":", [ !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}', 'DFIR2' ] ]
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildBucketName}/*'               
+          PolicyName: PermissionsInitDSARepo
+
+  BuildDFIRPipeArtifactStore:
+    Type: AWS::S3::Bucket
+
+  PrepDataSyncConnLambda:
+    DependsOn: InitDSARepoResource
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ./PrepDataSyncConn
+      Description: 'Prepare DataSync Connection lambda'
+      Environment:
+        Variables:
+          Ac: !Sub '${AWS::AccountId}'
+          Re: !Sub '${AWS::Region}'
+      FunctionName: PrepDataSyncConn
+      Handler: PrepDataSyncConn.lambda_handler
+      Role: !Ref DFIRChildLambdaRoleARN
+      Runtime: python3.8
+      Timeout: 5
+
+  BuildDFIRPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BuildDFIRPipelineRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - 
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: [cloudformation.amazonaws.com]
+              - Effect: Allow
+                Action:
+                  - codedeploy:Get*
+                  - codedeploy:List*
+                  - codedeploy:CreateDeployment
+                  - codedeploy:CreateDeploymentConfig
+                  - codedeploy:CreateDeploymentGroup
+                  - codedeploy:RegisterApplicationRevision
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - 'arn:aws:s3:::builddfirpipeline-builddfirpipeartifactstore-*'
+                  - 'arn:aws:s3:::builddfirpipeline-builddfirpipeartifactstore-*/*'
+              - Effect: Allow
+                Action:
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:CancelUploadArchive
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR1'
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR2'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:ListFunctions
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:PrepDataSyncConn'
+          PolicyName: PermissionsForDFIRPipeline
+
+  DSAApplicationDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DSAApplicationDeployRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  BuildDFIRCFNDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BuildDFIRCFNDeployRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeRouteTables
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:DeleteVpcPeeringConnection
+                  - ec2:CreateVpcPeeringConnection
+                  - ec2:CreateVpc
+                  - ec2:CreateRoute
+                  - ec2:DescribeInstances
+                  - ec2:AssociateRouteTable
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:DeleteRoute
+                  - ec2:DeleteVpc
+                  - ec2:DeleteSecurityGroup
+                  - ec2:CreateTags
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateRouteTable
+                  - ec2:DescribeImages
+                  - ec2:DescribeVpcPeeringConnections
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:ModifyVpcAttribute
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeVpcs
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ssm:GetParameters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/ActivateDSAEC2Role'
+              - Effect: Allow
+                Action:
+                  - iam:GetInstanceProfile
+                  - iam:CreateInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:DeleteInstanceProfile
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:instance-profile/ActivateDSAInstanceProfile'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/EFS-DFIR-Stack-SharedVPCPeerRole-*'
+          PolicyName: PermissionsForCloudFormation
+     
+  ActivateDSAApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties: 
+      ApplicationName: ActivateDSAApplication
+      ComputePlatform: Server
+
+  ActivateDSADeployGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties: 
+      ApplicationName: ActivateDSAApplication
+      DeploymentGroupName: ActivateDSADeploymentGroup
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      DeploymentStyle: 
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+        DeploymentType: IN_PLACE
+      Ec2TagFilters: 
+        - Key: DFIRResources
+          Type: KEY_AND_VALUE
+          Value: ActivateCreateDataSyncAgent
+      ServiceRoleArn: !GetAtt DSAApplicationDeployRole.Arn
+
+  BuildDFIRPipeline:
+    DependsOn: PrepDataSyncConnLambda
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        Location: !Ref BuildDFIRPipeArtifactStore
+        Type: S3
+      Name: BuildDFIRPipeline
+      RoleArn: !GetAtt BuildDFIRPipelineRole.Arn
+      Stages: 
+        - Name: Source
+          Actions: 
+            - Name: SourceDFIRResources
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: DFIR1
+                BranchName: main
+                PollForSourceChanges: false
+              Namespace: SourceNamespace
+              OutputArtifacts:
+                - Name: SourceArtifacts
+              RunOrder: 1
+        - Name: Deploy
+          Actions: 
+            - Name: PrepBuildDFIRResources
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: BuildDFIRResources
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: PrepBuildDFIRResources-ChangeSet
+                RoleArn: !GetAtt BuildDFIRCFNDeploy.Arn
+                TemplatePath: 'SourceArtifacts::BuildDFIRResources.yaml'
+                TemplateConfiguration: 'SourceArtifacts::BuildDFIRParameters.json'
+              InputArtifacts:
+                - Name: SourceArtifacts
+              OutputArtifacts:
+                - Name: DeployArtifacts
+              RunOrder: 1
+            - Name: ExecuteBuildDFIRResources
+              ActionTypeId: 
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: BuildDFIRResources               
+                ChangeSetName: PrepBuildDFIRResources-ChangeSet  
+              InputArtifacts:
+                - Name: DeployArtifacts
+              OutputArtifacts:
+                - Name: DeployedArtifacts
+              Namespace: DeployVariables
+              RunOrder: 2
+        - Name: Invoke
+          Actions:
+            - Name: PrepDataSyncConn
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: PrepDataSyncConn
+                # Limit to 1000 chars or less 
+                UserParameters: '[{"name":"Bkt","value":"#{DeployVariables.Bkt}"},{"name":"VeId","value":"#{DeployVariables.VeId}"},{"name":"Ve2Id","value":"#{DeployVariables.Ve2Id}"},{"name":"Ve3Id","value":"#{DeployVariables.Ve3Id}"},{"name":"SGDSVe","value":"#{DeployVariables.SGDSVe}"},{"name":"SGDSVe2","value":"#{DeployVariables.SGDSVe2}"},{"name":"SGDSVe3","value":"#{DeployVariables.SGDSVe3}"},{"name":"DR","value":"#{DeployVariables.DR}"},{"name":"SN","value":"#{DeployVariables.SN}"},{"name":"DSAIP1","value":"#{DeployVariables.DSAIP1}"},{"name":"DSAIP2","value":"#{DeployVariables.DSAIP2}"},{"name":"DSAIP3","value":"#{DeployVariables.DSAIP3}"},{"name":"DSASGID1","value":"#{DeployVariables.DSASGID1}"},{"name":"DSASGID2","value":"#{DeployVariables.DSASGID2}"},{"name":"DSASGID3","value":"#{DeployVariables.DSASGID3}"},{"name":"TA","value":"#{DeployVariables.TA}"},{"name":"TVpcID","value":"#{DeployVariables.TVpcID}"},{"name":"Pi","value":"#{DeployVariables.Pi}"},{"name":"VId","value":"#{DeployVariables.VId}"}]'
+              InputArtifacts:
+                - Name: DeployedArtifacts
+              OutputArtifacts:
+                - Name: InvokedArtifacts
+              RunOrder: 1
+
+  ActivateDSAPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        Location: !Ref BuildDFIRPipeArtifactStore
+        Type: S3
+      Name: ActivateDSAPipeline
+      RoleArn: !GetAtt BuildDFIRPipelineRole.Arn
+      Stages: 
+        - Name: Source
+          Actions:
+            - Name: SourceDFIRResources
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: DFIR2
+                BranchName: main
+                PollForSourceChanges: false
+              Namespace: SourceNamespace
+              OutputArtifacts:
+                - Name: SourceArtifacts
+              RunOrder: 1
+        - Name: DeployOnInstance
+          Actions:
+            - Name: ActivateDSAgent
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: ActivateDSAApplication
+                DeploymentGroupName: !Ref ActivateDSADeployGroup
+              InputArtifacts:
+                - Name: SourceArtifacts
+              RunOrder: 1
+
+  MonitorPipelinesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MonitorPipelinesRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: PermissionsForRule
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: 
+                  - !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref ActivateDSAPipeline] ]
+                  - !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref BuildDFIRPipeline] ]
+
+  MonitorBuildPipelineRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Triggers when codecommit repo changes'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR1'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceName:
+            - main
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref BuildDFIRPipeline] ]
+          RoleArn: !GetAtt MonitorPipelinesRole.Arn
+          Id: MonitorBuildPipelineRuleName
+
+  MonitorDSAPipelineRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Triggers when codecommit repo changes'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:DFIR2'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceName:
+            - main
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref ActivateDSAPipeline] ]
+          RoleArn: !GetAtt MonitorPipelinesRole.Arn
+          Id: MonitorDSAPipelineRuleName

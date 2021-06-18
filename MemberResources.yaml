@@ -1,0 +1,548 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies the resources required in member accounts to prepare for DFIR.
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: DFIR Account Information
+        Parameters:
+          - DFIRAccountId
+          - SecurityTriageBucketArn
+          - PrepMemberAcctLambdaRoleArn
+          - BuildDFIRBucketName
+          - DFIRVPCId
+          - DFIRSubnetId
+          - DFIRRouteTbId
+          - DFIRCIDRRange
+      - Label:
+          default: Initialize New CodeCommit Repository for DFIR Resources in Targets
+        Parameters:
+          - LayerVersionARN
+Parameters:
+  DFIRAccountId:
+    Type: String
+    MinLength: 12
+    MaxLength: 12
+    Description: 'Specify the DFIR Account Id'
+  BuildDFIRBucketName:
+    Type: String
+    Description: 'Specify the bucket name used to build DFIR resources'
+  SecurityTriageBucketArn:
+    Type: String
+    Description: 'Specify the Security Triage bucket ARN in the DFIR Account'
+  PrepMemberAcctLambdaRoleArn:
+    Type: String
+    Description: 'Specify the prep member account lambda role ARN in DFIR Account'
+  DFIRVPCId:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the existing DFIR VPCId in DFIR Account if any'
+  DFIRCIDRRange:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the existing DFIR VPC CIDR Range in DFIR Account if any'
+  DFIRSubnetId:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the associated DFIR SubnetId in DFIR Account if any'
+  DFIRRouteTbId:
+    Type: String
+    Default: 'None'
+    Description: 'Specify the associated DFIR Route Table Id in DFIR Account if any'
+  LayerVersionARN:
+    Type: String
+    Description: 'Specify the ARN of the Lambda Function'
+
+Resources:
+  EFSDFIRPipelineArtifactStore:
+    Type: AWS::S3::Bucket
+
+  InitTargetStore:
+    Type: Custom::InitRepoResource
+    Properties: 
+      ServiceToken: !GetAtt InitTargetStoreLambda.Arn
+      RepoName: TargetStore
+      BuildBucketName: !Ref BuildDFIRBucketName
+
+  InitTargetStoreLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          codecommit = boto3.client('codecommit')
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+            repoName = event['ResourceProperties']['RepoName']
+            buildbucket = event['ResourceProperties']['BuildBucketName']
+            responseData = {}
+            if event['RequestType'] == 'Create':
+                r = codecommit.create_repository(repositoryName=repoName)
+                responseData['repositoryName'] = r['repositoryMetadata']['repositoryName']
+                if r['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    key = 'TargetResources.yaml'
+                    targetres = '/tmp/' + key
+                    s3.download_file(buildbucket, key, targetres)
+                    with open(targetres, 'rb') as f:                      
+                        s = codecommit.put_file(repositoryName=repoName, branchName='main', fileContent=f.read(), filePath='TargetResources.yaml',fileMode='NORMAL',commitMessage='Added TargetResources',name='InitTargetStoreLambda', email='jasmchua@amazon.com')
+                        responseData['commitId'] = s['commitId']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = r
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+            if event['RequestType'] == 'Delete' or event['RequestType'] == 'Update':
+                e = codecommit.delete_repository(repositoryName=repoName)
+                if e['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    responseData['error'] = e
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      Description: 'Initialize codecommit repository'
+      FunctionName: InitializeRepoLambda
+      Handler: index.lambda_handler
+      Role: !GetAtt InitializeRepoRole.Arn
+      Layers:
+        - !Ref LayerVersionARN
+      Runtime: python3.8
+      Timeout: 900
+      MemorySize: 1024
+
+  InitializeRepoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InitializeRepoRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - 
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CreateRepository
+                  - codecommit:DeleteRepository
+                  - codecommit:CreateBranch
+                  - codecommit:DeleteBranch
+                  - codecommit:PutFile
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:TargetStore'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildDFIRBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildDFIRBucketName}/*'
+          PolicyName: PermissionsInitRepo
+
+  MemberDFIRInvokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MemberDFIRInvokerRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref DFIRAccountId
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PermissionsForLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AcceptVpcPeeringConnection
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc-peering-connection/*"
+              - Effect: Allow
+                Action:
+                  - codecommit:PutFile
+                  - codecommit:GetBranch
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:TargetStore'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ec2:CreateRoute
+                  - ec2:DescribeVpcPeeringConnections
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeInstances
+                  - kms:Decrypt
+                Resource:
+                  - '*'
+
+  PrepMemberAcctLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PrepMemberAcctLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PermissionsPrepMemberAcctLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Ref PrepMemberAcctLambdaRoleArn
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:DescribeSecurityGroups
+                  - kms:Decrypt
+                  - logs:CreateLogStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Ref SecurityTriageBucketArn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectVersionAcl
+                Resource:
+                  - !Join [ "/", [!Ref SecurityTriageBucketArn, "*"] ]
+                Condition:
+                  StringEquals:
+                    's3:x-amz-acl': bucket-owner-full-control
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                Resource:
+                  - !Join [ "/", [!Ref SecurityTriageBucketArn, "*"] ]
+
+  PrepMemberAcctLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Code: 
+        ./PrepMemberAcct
+      Description: 'Prepare Member Account Lambda function'
+      Environment:
+        Variables:
+          TriageBucketArn: !Ref SecurityTriageBucketArn
+          MemberAcct: !Sub '${AWS::AccountId}'
+          Role: !Ref PrepMemberAcctLambdaRoleArn
+          DFIRRepo: DFIR1
+          DFIRSubnetId: !Ref DFIRSubnetId
+          DFIRVpcId: !Ref DFIRVPCId
+          DFIRRouteTbId: !Ref DFIRRouteTbId
+          DFIRCIDRRange: !Ref DFIRCIDRRange
+      FunctionName: PrepMemberAcct
+      Handler: PrepMemberAcct.lambda_handler
+      Role: !GetAtt PrepMemberAcctLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      Timeout: 5
+
+  EFSDFIRPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EFSDFIRPipelineRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - 
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: [cloudformation.amazonaws.com]
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetRepository
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:TargetStore'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                  - lambda:InvokeFunction
+                  - lambda:ListFunctions
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketPolicy
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Join [ '',[ 'arn:aws:s3:::',!Ref EFSDFIRPipelineArtifactStore ] ]
+                  - !Join [ '/', [ !GetAtt EFSDFIRPipelineArtifactStore.Arn, '*' ] ]
+          PolicyName: PermissionsForEFSDFIRPipeline
+
+  MemberDFIRCloudFormationDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MemberDFIRCloudFormationDeployRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreatePlacementGroup
+                  - ec2:DescribePlacementGroups
+                  - ec2:CreateTags
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RunInstances
+                  - ec2:DescribeInstances
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:DescribeImages
+                  - ec2:DeletePlacementGroup
+                  - ec2:TerminateInstances
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:CreateFileSystem
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:DeleteFileSystem
+                  - elasticfilesystem:DeleteMountTarget
+                  - kms:DescribeKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:CreateGrant
+                  # - s3:GetObject
+                  # - s3:GetObjectTagging
+                  # - s3:GetBucketAcl
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:GetRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/EFS-DFIR-Stack-SharedVPCPeerRole-*'
+          PolicyName: PermissionsForCloudFormation
+                  
+  EFSDFIRPipeline:
+    DependsOn: PrepMemberAcctLambda
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        Location: !Ref EFSDFIRPipelineArtifactStore
+        Type: S3
+      Name: EFSDFIRPipeline
+      RoleArn: !GetAtt EFSDFIRPipelineRole.Arn
+      Stages: 
+        - Name: Source-DFIR-Member
+          Actions:
+            - Name: TargetStoreCodeCommit
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: TargetStore
+                BranchName: main
+                PollForSourceChanges: false
+              Namespace: SourceCodeNamespace
+              OutputArtifacts:
+                - Name: SourceArtifacts
+              RunOrder: 1
+        - Name: Deploy-DFIR-Member
+          Actions: 
+            - Name: CreateEFSDFIRChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: EFS-DFIR-Stack
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: EFS-DFIR-Changeset
+                RoleArn: !GetAtt MemberDFIRCloudFormationDeploy.Arn
+                TemplatePath: 'SourceArtifacts::TargetResources.yaml'
+                TemplateConfiguration: 'SourceArtifacts::TargetParameters.json'
+              InputArtifacts:
+                - Name: SourceArtifacts
+              OutputArtifacts:
+                - Name: DeployArtifacts
+              RunOrder: 1
+            - Name: ExecuteEFSDFIRChangeSet
+              ActionTypeId: 
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: EFS-DFIR-Stack               
+                ChangeSetName: EFS-DFIR-Changeset   
+                #OutputFileName: EFSDFIRStackOutput.json    
+              InputArtifacts:
+                - Name: DeployArtifacts
+              OutputArtifacts:
+                - Name: EFSDFIRArtifacts
+              Namespace: DeployVariables
+              RunOrder: 2
+        - Name: Invoke-DFIR-Member
+          Actions:
+            - Name: InvokePrepMemberAcct
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: PrepMemberAcct
+                UserParameters: '[{"name":"VPRoleARN","value":"#{DeployVariables.VPRoleARN}"},{"name":"DSASGId1","value":"#{DeployVariables.DSASGId1}"},{"name":"DSAEC2IP1","value":"#{DeployVariables.DSAEC2IP1}"},{"name":"SGIdEMT1","value":"#{DeployVariables.SGIdEMT1}"},{"name":"DSASGId2","value":"#{DeployVariables.DSASGId2}"},{"name":"DSAEC2IP2","value":"#{DeployVariables.DSAEC2IP2}"},{"name":"SGIdEMT2","value":"#{DeployVariables.SGIdEMT2}"},{"name":"DSASGId3","value":"#{DeployVariables.DSASGId3}"},{"name":"DSAEC2IP3","value":"#{DeployVariables.DSAEC2IP3}"},{"name":"SGIdEMT3","value":"#{DeployVariables.SGIdEMT3}"}]'
+              InputArtifacts:
+                - Name: EFSDFIRArtifacts
+              OutputArtifacts:
+                - Name: InvokedArtifacts
+              RunOrder: 1
+      Tags: 
+        - Key: Name
+          Value: DFIR
+
+  MonitorCodeCommitEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MonitorCodeCommitEventRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: PermissionsForRule
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref EFSDFIRPipeline] ]
+
+  MonitorCodeCommitEventRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Triggers when codecommit repo changes'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:TargetStore'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceName:
+            - main
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            !Join [ '', [!Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:', !Ref EFSDFIRPipeline] ]
+          Id: MonitorCodeCommitEventRuleName
+          RoleArn: !GetAtt MonitorCodeCommitEventRole.Arn
+
+Outputs:
+  MemberDFIRInvokerRoleARN:
+    Value: !GetAtt MemberDFIRInvokerRole.Arn

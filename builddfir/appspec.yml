@@ -1,0 +1,17 @@
+version: 0.0
+os: linux
+files:
+  - source: activate.sh
+    destination: /tmp
+permissions:
+  - object: /tmp
+    pattern: "*.sh"
+    owner: ec2-user
+    mode: 755
+    type:
+      - file
+hooks:
+  AfterInstall:
+    - location: activate.sh
+      timeout: 600
+      runas: root

@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies the DFIR resources required in the DFIR account including initial S3 bucket storing lambda code
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Lambda code storage bucket name
+        Parameters:
+          - LambdaCodeBucketName
+      - Label:
+          default: Your Organization ID
+        Parameters:
+          - OrganizationID
+Parameters:
+  LambdaCodeBucketName:
+    Type: String
+    Description: 'Specify the bucket name where you store DFIR lambda code'
+  OrganizationID:
+    Type: String
+    Description: 'Specify your organization ID'
+
+Resources:
+  LambdaCodeBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      BucketName: !Ref LambdaCodeBucketName
+      VersioningConfiguration:
+        Status: Enabled
+
+  LambdaCodeBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    DependsOn: LambdaCodeBucket
+    Properties:
+      Bucket: !Ref LambdaCodeBucketName
+      PolicyDocument:
+        Statement:
+          - Sid: "DenyInsecureConnections"
+            Effect: Deny
+            Principal: "*"
+            Action:
+            - 's3:*'
+            Resource:
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}'
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: "AllowPutObjects"
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+            - s3:PutObject
+            - s3:PutObjectAcl
+            - s3:PutObjectVersionAcl
+            Resource:
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}'
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:PrincipalOrgID: !Ref OrganizationID
+          - Sid: "AllowGetObjects"
+            Effect: Allow
+            Principal: 
+              AWS: '*'
+            Action:
+            - s3:ListBucket
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:GetObjectAcl
+            Resource:
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}'
+            - !Sub 'arn:aws:s3:::${LambdaCodeBucketName}/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: 
+                  - !Ref OrganizationID

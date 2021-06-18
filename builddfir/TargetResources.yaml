@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Specifies VPC Peering IAM role (if necessary), EFS and Mount Targets, AMI DataSync agent, Relevant Security Groups and Routing
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: DFIR Account Information
+        Parameters:
+          - DFIRAccountId
+      - Label:
+          default: VPC Peer Role Required
+        Parameters:
+          - PeerRoleRequired
+# So many EFS Mount Targets parameters required here because of CloudFormation current limitation of not supporting length count for Parameter List type.
+# To optimize code when such a feature of CloudFormation Parameter is released in the future
+# Assumption: This template supports only up to three availability zones in a single region.
+      - Label:
+          default: Setup First EFS MountTarget
+        Parameters:
+          - VpcId1
+          - TargetSecurityGroup1
+          - SubnetId1
+          - AvailabilityZone1
+      - Label:
+          default: Setup Second EFS MountTarget
+        Parameters:
+          - VpcId2
+          - TargetSecurityGroup2
+          - SubnetId2
+          - AvailabilityZone2
+      - Label:
+          default: Setup Third EFS MountTarget
+        Parameters:
+          - VpcId3
+          - TargetSecurityGroup3
+          - SubnetId3
+          - AvailabilityZone3
+      - Label:
+          default: Setup DataSync Agent for EFS MountTarget
+        Parameters:
+          - DataSyncAMIID
+
+Parameters:
+  DFIRAccountId:
+    Type: String
+    Description: "Please provide the 12 Digit AWS Account Number of DFIR account"
+    MaxLength: 12
+    MinLength: 12
+  PeerRoleRequired:
+    Type: String
+    Default: 'False'
+    AllowedValues:
+      - 'True'
+      - 'False'
+    Description: "Please indicate whether VPC peering is required or not"
+  VpcId1:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the VPCId associated with EFS mount target one"
+  TargetSecurityGroup1:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Target instance SecurityGroupId to connect to EFS mount target one"
+  SubnetId1:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the SubnetId for EFS mount target one"
+  AvailabilityZone1:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Availability Zone for EFS mount target one"
+  VpcId2:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the VPCId associated with EFS mount target two"
+  TargetSecurityGroup2:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Target instance SecurityGroupId to connect to EFS mount target two"
+  SubnetId2:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the SubnetId for EFS mount target two"
+  AvailabilityZone2:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Availability Zone for EFS mount target two"
+  VpcId3:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the VPCId associated with EFS mount target three"
+  TargetSecurityGroup3:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Target instance SecurityGroupId to connect to EFS mount target three"
+  SubnetId3:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the SubnetId for EFS mount target three"
+  AvailabilityZone3:
+    Type: String
+    Default: 'None'
+    Description: "Please provide the Availability Zone for EFS mount target three"
+  DataSyncAMIID:
+    Type: AWS::EC2::Image::Id
+    Description: "Please provide AMI ID for DataSync Agent EC2"
+
+Conditions:
+  CreatePeerRole: !Equals [!Ref PeerRoleRequired, 'True']
+  CreateEFSMountTargetOne: !Not [!Equals [!Ref AvailabilityZone1, 'None']]
+  CreateEFSMountTargetTwo: !Not [!Equals [!Ref AvailabilityZone2, 'None']]
+  CreateEFSMountTargetThree: !Not [!Equals [!Ref AvailabilityZone3, 'None']]
+
+Resources:
+  SharedVPCPeerRole:
+    Condition: CreatePeerRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Principal:
+              AWS: !Ref DFIRAccountId
+            Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: acceptvpcpeerpolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'ec2:AcceptVpcPeeringConnection'
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc-peering-connection/*"
+
+  SharedTriageFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${DFIRAccountId}:alias/DFIR-EFS-KEY"
+# To add for future enhancement - allow Instance Role with custom Principal Tag
+#      FileSystemPolicy: Json
+      FileSystemTags: 
+        - Key: Name
+          Value: DFIR
+      PerformanceMode: generalPurpose
+
+  SecGrpOneEFSMountT:
+    Condition: CreateEFSMountTargetOne
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for EFS MountTarget one
+      GroupName: SecGrpOneEFSMountT
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic on all protocols outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref TargetSecurityGroup1
+          Description: Allow incoming from target instance security group
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId1
+
+  EFSMountTargetOne:
+    DependsOn: SharedTriageFileSystem
+    Condition: CreateEFSMountTargetOne
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SharedTriageFileSystem
+      SecurityGroups: 
+        - !GetAtt SecGrpOneEFSMountT.GroupId
+      SubnetId: !Ref SubnetId1
+
+  SecGrpTwoEFSMountT:
+    DependsOn: SharedTriageFileSystem
+    Condition: CreateEFSMountTargetTwo
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for EFS MountTarget two
+      GroupName: SecGrpTwoEFSMountT
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic on all protocols outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref TargetSecurityGroup2
+          Description: Allow incoming from target instance subnet
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId2
+
+  EFSMountTargetTwo:
+    DependsOn: SharedTriageFileSystem
+    Condition: CreateEFSMountTargetTwo
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SharedTriageFileSystem
+      SecurityGroups: 
+        - !GetAtt SecGrpTwoEFSMountT.GroupId
+      SubnetId: !Ref SubnetId2
+
+  SecGrpThreeEFSMountT:
+    DependsOn: SharedTriageFileSystem
+    Condition: CreateEFSMountTargetThree
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for EFS MountTarget three
+      GroupName: SecGrpThreeEFSMountT
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          Description: Allow All traffic on all protocols outbound
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref TargetSecurityGroup3
+          Description: Allow incoming from target instance subnet
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId3
+
+  EFSMountTargetThree:
+    DependsOn: SharedTriageFileSystem
+    Condition: CreateEFSMountTargetThree
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SharedTriageFileSystem
+      SecurityGroups: 
+        - !GetAtt SecGrpThreeEFSMountT.GroupId
+      SubnetId: !Ref SubnetId3
+
+  DataSyncAgentPlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  DataSyncAgentPlacementGroup2:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  DataSyncAgentPlacementGroup3:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  DataSyncAgentSecGrpOne:
+    Condition: CreateEFSMountTargetOne
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync Agent supporting EFS MountTarget One 
+      GroupName: DataSyncAgentSecGrpOne
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          # This can be further restricted to the four network interfaces created by datasync task
+          Description: Allow port 443 outbound to all 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - DestinationSecurityGroupId: !GetAtt SecGrpOneEFSMountT.GroupId
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          # port 80 on DataSync EC2 will be closed after agent is activated. This can be further restricted to only the SourceIP that is activating the agent.
+          Description: Allow incoming from all on port 80
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId1
+
+  DataSyncAgentSecGrpTwo:
+    Condition: CreateEFSMountTargetTwo
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync Agent supporting EFS MountTarget Two
+      GroupName: DataSyncAgentSecGrpTwo
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          # This can be further restricted to the four network interfaces created by datasync task
+          Description: Allow port 443 outbound to all 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - DestinationSecurityGroupId: !GetAtt SecGrpTwoEFSMountT.GroupId
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049        
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          # port 80 on DataSync EC2 will be closed after agent is activated. This can be further restricted to only the SourceIP that is activating the agent.
+          Description: Allow incoming from all on port 80
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId2
+
+  DataSyncAgentSecGrpThree:
+    Condition: CreateEFSMountTargetThree
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for DataSync Agent supporting EFS MountTarget Three 
+      GroupName: DataSyncAgentSecGrpThree
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          # This can be further restricted to the four network interfaces created by datasync task
+          Description: Allow port 443 outbound to all 
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - DestinationSecurityGroupId: !GetAtt SecGrpThreeEFSMountT.GroupId
+          FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049        
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          # port 80 on DataSync EC2 will be closed after agent is activated. This can be further restricted to only the SourceIP that is activating the agent.
+          Description: Allow incoming from all on port 80
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      Tags: 
+        - Key: Name
+          Value: DFIR
+      VpcId: !Ref VpcId3
+
+  DataSyncAgentEC2One:
+    Condition: CreateEFSMountTargetOne
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone1
+      ImageId: !Ref DataSyncAMIID
+      InstanceType: m5.2xlarge
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            Encrypted: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          GroupSet: [!GetAtt DataSyncAgentSecGrpOne.GroupId]
+          SubnetId: !Ref SubnetId1
+      PlacementGroupName: !Ref DataSyncAgentPlacementGroup
+      SourceDestCheck: true
+      Tags:
+        - Key: Name
+          Value: DFIR
+
+  DataSyncAgentEC2Two:
+    Condition: CreateEFSMountTargetTwo
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone2
+      ImageId: !Ref DataSyncAMIID
+      InstanceType: m5.2xlarge
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            Encrypted: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          GroupSet: [!GetAtt DataSyncAgentSecGrpTwo.GroupId]
+          SubnetId: !Ref SubnetId2
+      PlacementGroupName: !Ref DataSyncAgentPlacementGroup2
+      SourceDestCheck: true
+      Tags:
+        - Key: Name
+          Value: DFIR
+
+  DataSyncAgentEC2Three:
+    Condition: CreateEFSMountTargetThree
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone3
+      ImageId: !Ref DataSyncAMIID
+      InstanceType: m5.2xlarge
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            Encrypted: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          GroupSet: [!GetAtt DataSyncAgentSecGrpThree.GroupId]
+          SubnetId: !Ref SubnetId3
+      PlacementGroupName: !Ref DataSyncAgentPlacementGroup3
+      SourceDestCheck: true
+      Tags:
+        - Key: Name
+          Value: DFIR
+
+Outputs:
+  VPRoleARN:
+    Value: !If [CreatePeerRole, !GetAtt SharedVPCPeerRole.Arn, 'None']
+  DSAEC2IP1:
+    Condition: CreateEFSMountTargetOne
+    Value: !GetAtt DataSyncAgentEC2One.PrivateIp
+  DSASGId1:
+    Condition: CreateEFSMountTargetOne
+    Value: !GetAtt DataSyncAgentSecGrpOne.GroupId
+  DSAEC2IP2:
+    Value: !If [CreateEFSMountTargetTwo, !GetAtt DataSyncAgentEC2Two.PrivateIp, 'None']
+  DSASGId2:
+    Value: !If [CreateEFSMountTargetTwo, !GetAtt DataSyncAgentSecGrpTwo.GroupId, 'None']
+  DSAEC2IP3:
+    Value: !If [CreateEFSMountTargetThree, !GetAtt DataSyncAgentEC2Three.PrivateIp, 'None']
+  DSASGId3:
+    Value: !If [CreateEFSMountTargetThree, !GetAtt DataSyncAgentSecGrpThree.GroupId, 'None']
+  SGIdEMT1:
+    Condition: CreateEFSMountTargetOne
+    Value: !GetAtt SecGrpOneEFSMountT.GroupId
+  SGIdEMT2:
+    Value: !If [CreateEFSMountTargetTwo, !GetAtt SecGrpTwoEFSMountT.GroupId, 'None']
+  SGIdEMT3:
+    Value: !If [CreateEFSMountTargetThree, !GetAtt SecGrpThreeEFSMountT.GroupId, 'None']
