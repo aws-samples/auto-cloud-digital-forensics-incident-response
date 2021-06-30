@@ -17,7 +17,7 @@ def ip(g):
 def prep(bkt, i, v, b, n, m):
     for c, x in enumerate(i):
         if x != "None":
-            d = "VAR"+str(c)+"=$(curl -s \"http://"+x+"/?gatewayType=SYNC&activationRegion=ap-southeast-1&privateLinkEndpoint="+v+"&endpointType=PRIVATE_LINK&no_redirect\")\n"
+            d = "VAR"+str(c)+"=$(curl -s \"http://"+x+"/?gatewayType=SYNC&activationRegion="+Re+"&privateLinkEndpoint="+v+"&endpointType=PRIVATE_LINK&no_redirect\")\n"
             e = "aws datasync create-agent --agent-name agent"+str(c)+" --vpc-endpoint-id "+b+" --subnet-arns arn:aws:ec2:"+Re+":"+Ac+":subnet/"+n+" --security-group-arns arn:aws:ec2:"+Re+":"+Ac+":security-group/"+m+" --activation-key $VAR"+str(c)+" --region "+Re+"\n"
             j.append(d)
             j.append(e)
